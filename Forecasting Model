@@ -1,0 +1,260 @@
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from scipy import signal
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from sklearn.metrics import roc_auc_score, precision_recall_curve
+
+# Data Processing Functions
+def process_wearable_data(raw_data: pd.DataFrame) -> np.ndarray:
+    """
+    Process raw wearable device data into formatted windows.
+    
+    Parameters:
+        raw_data: DataFrame containing sensor readings.
+    
+    Returns:
+        Processed and normalized data windows.
+    """
+    features = {
+        'acc': ['x', 'y', 'z'],
+        'eda': ['conductance'],
+        'hr': ['bpm'],
+        'temp': ['celsius']
+    }
+    
+    # Window parameters
+    window_size = 60 * 30  # 30 minute windows
+    overlap = 0.5  # 50% overlap
+    processed_windows = []
+    
+    for start in range(0, len(raw_data), int(window_size * overlap)):
+        window = raw_data.iloc[start:start + window_size]
+        
+        if len(window) == window_size:
+            window_features = extract_features(window, features)
+            processed_windows.append(window_features)
+    
+    return np.array(processed_windows)
+
+def extract_features(window: pd.DataFrame, feature_config: dict) -> np.ndarray:
+    """
+    Extract statistical and frequency domain features.
+    
+    Parameters:
+        window: DataFrame with sensor data in a single window.
+        feature_config: Dictionary specifying the signal types and channels.
+    
+    Returns:
+        A numpy array of extracted features.
+    """
+    features = []
+    for signal_type, channels in feature_config.items():
+        for channel in channels:
+            data = window[f'{signal_type}_{channel}']
+            
+            # Time domain features
+            features.extend([
+                np.mean(data),
+                np.std(data),
+                np.median(data),
+                np.max(data),
+                np.min(data)
+            ])
+            
+            # Frequency domain features
+            if signal_type in ['acc', 'eda']:
+                freqs, psd = signal.welch(data)
+                features.extend([
+                    np.sum(psd),
+                    np.mean(psd),
+                    freqs[np.argmax(psd)]
+                ])
+    
+    return np.array(features)
+
+# LSTM Model Architecture
+def build_model(input_shape: tuple, lstm_units: list = [64, 32], dropout: float = 0.5) -> tf.keras.Model:
+    """
+    Build LSTM model for seizure forecasting.
+    
+    Parameters:
+        input_shape: Shape of input data (timesteps, features).
+        lstm_units: List of units in LSTM layers.
+        dropout: Dropout rate.
+    
+    Returns:
+        Compiled Keras model.
+    """
+    model = Sequential()
+    
+    # First LSTM layer
+    model.add(LSTM(lstm_units[0], input_shape=input_shape, return_sequences=True))
+    model.add(Dropout(dropout))
+    
+    # Additional LSTM layers
+    for units in lstm_units[1:]:
+        model.add(LSTM(units, return_sequences=False))
+        model.add(Dropout(dropout))
+    
+    # Output layer
+    model.add(Dense(1, activation='sigmoid'))
+    
+    # Compile model
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['AUC'])
+    
+    return model
+
+# Training Pipeline
+class SeizureForecaster:
+    def __init__(self, prediction_horizon: int = 30, sequence_length: int = 60):
+        """
+        Initialize seizure forecasting system.
+        
+        Parameters:
+            prediction_horizon: Minutes ahead to predict.
+            sequence_length: Number of windows in sequence.
+        """
+        self.prediction_horizon = prediction_horizon
+        self.sequence_length = sequence_length
+        self.model = None
+        self.scaler = StandardScaler()
+
+    def prepare_sequences(self, features: np.ndarray, labels: np.ndarray) -> tuple:
+        """
+        Prepare sequential data for LSTM.
+        
+        Parameters:
+            features: Extracted features.
+            labels: Seizure labels (1 for seizure, 0 for no seizure).
+        
+        Returns:
+            X (sequences), y (labels).
+        """
+        X, y = [], []
+        
+        for i in range(len(features) - self.sequence_length):
+            X.append(features[i:i + self.sequence_length])
+            # Label is 1 if seizure occurs within prediction horizon
+            future_window = labels[i + self.sequence_length:i + self.sequence_length + self.prediction_horizon]
+            y.append(1 if np.any(future_window) else 0)
+        
+        return np.array(X), np.array(y)
+
+    def train(self, train_data: tuple, val_data: tuple, epochs: int = 100, batch_size: int = 32) -> tf.keras.callbacks.History:
+        """
+        Train the forecasting model.
+        
+        Parameters:
+            train_data: Tuple of training data (features, labels).
+            val_data: Tuple of validation data (features, labels).
+            epochs: Number of training epochs.
+            batch_size: Batch size.
+        
+        Returns:
+            Training history.
+        """
+        X_train, y_train = train_data
+        X_val, y_val = val_data
+        
+        # Scale features
+        X_train_reshaped = X_train.reshape(-1, X_train.shape[-1])
+        X_val_reshaped = X_val.reshape(-1, X_val.shape[-1])
+        self.scaler.fit(X_train_reshaped)
+        X_train_scaled = self.scaler.transform(X_train_reshaped)
+        X_val_scaled = self.scaler.transform(X_val_reshaped)
+        X_train_scaled = X_train_scaled.reshape(X_train.shape)
+        X_val_scaled = X_val_scaled.reshape(X_val.shape)
+        
+        # Build and train model
+        self.model = build_model(input_shape=(self.sequence_length, X_train.shape[-1]))
+        history = self.model.fit(
+            X_train_scaled, y_train,
+            validation_data=(X_val_scaled, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_auc', patience=10, restore_best_weights=True)]
+        )
+        
+        return history
+
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        """
+        Generate seizure probability predictions.
+        
+        Parameters:
+            features: Processed features (windows).
+        
+        Returns:
+            Predicted probabilities for seizures.
+        """
+        # Scale features
+        features_reshaped = features.reshape(-1, features.shape[-1])
+        features_scaled = self.scaler.transform(features_reshaped)
+        features_scaled = features_scaled.reshape(features.shape)
+        
+        # Generate predictions
+        predictions = self.model.predict(features_scaled)
+        return predictions
+
+# Evaluation Function
+def evaluate_forecaster(y_true: np.ndarray, y_pred: np.ndarray, random_predictions: np.ndarray) -> dict:
+    """
+    Evaluate forecasting performance vs random baseline.
+    
+    Parameters:
+        y_true: Actual labels (ground truth).
+        y_pred: Model predictions.
+        random_predictions: Random baseline predictions.
+    
+    Returns:
+        Dictionary of evaluation metrics.
+    """
+    # Calculate AUC-ROC
+    actual_auc = roc_auc_score(y_true, y_pred)
+    random_auc = roc_auc_score(y_true, random_predictions)
+    
+    # Calculate precision-recall curve
+    precision, recall, thresholds = precision_recall_curve(y_true, y_pred)
+    
+    return {
+        'auc_roc': actual_auc,
+        'random_auc': random_auc,
+        'precision': precision,
+        'recall': recall,
+        'thresholds': thresholds
+    }
+
+# Usage Example
+# Load and process data
+raw_data = pd.read_csv('wearable_data.csv')
+seizure_labels = pd.read_csv('seizure_events.csv')
+processed_data = process_wearable_data(raw_data)
+
+# Initialize forecaster
+forecaster = SeizureForecaster(prediction_horizon=30, sequence_length=60)
+
+# Prepare sequences
+X, y = forecaster.prepare_sequences(processed_data, seizure_labels)
+
+# Split data into training and validation sets
+train_idx = int(len(X) * 0.8)
+X_train, y_train = X[:train_idx], y[:train_idx]
+X_val, y_val = X[train_idx:], y[train_idx:]
+
+# Train model
+history = forecaster.train(train_data=(X_train, y_train), val_data=(X_val, y_val))
+
+# Generate predictions
+predictions = forecaster.predict(X_val)
+
+# Evaluate performance
+random_predictions = np.random.random(len(y_val))
+metrics = evaluate_forecaster(y_val, predictions, random_predictions)
+
+# Print results
+print(f"AUC-ROC: {metrics['auc_roc']:.2f}")
+print(f"Random AUC-ROC: {metrics['random_auc']:.2f}")
